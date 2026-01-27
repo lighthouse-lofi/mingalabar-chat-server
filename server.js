@@ -226,14 +226,4 @@ io.on("connection", (socket) => {
 httpServer.listen(PORT, () => {
   console.log(`\n>>> Server active at http://localhost:${PORT} <<<\n`);
 });
-```
 
-### Deployment Instructions
-Since you are using Render + GitHub:
-1.  Save this content into your local `server.js`.
-2.  Open your terminal in that folder.
-3.  Run:
-    ```bash
-    git add server.js
-    git commit -m "Update server logic to professional standard"
-    git push
