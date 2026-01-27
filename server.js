@@ -5,84 +5,151 @@ const PORT = process.env.PORT || 3000;
 
 const httpServer = http.createServer((req, res) => {
   res.writeHead(200);
-  res.end("Mingalabar Chat Server is Running!");
+  res.end("Mingalabar Chat Server is Online!");
 });
 
 const io = new Server(httpServer, {
-  cors: {
-    origin: "*", 
-  },
+  cors: { origin: "*" },
+  pingInterval: 10000,
+  pingTimeout: 5000,
 });
 
-// STATE
-const waitingQueue = new Set(); 
-const activeChats = new Map(); 
+// --- STATE MANAGEMENT ---
+// Maps userId -> roomId
+const userRooms = new Map(); 
+
+// Maps userId -> { socketId, name, gender, age, filterGender }
+const waitingQueue = new Map(); 
+
+console.log(`🚀 Server starting on port ${PORT}`);
 
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
+  const userId = socket.handshake.query.userId;
+  
+  if (!userId) {
+    console.log("❌ Connection rejected: No userId");
+    socket.disconnect();
+    return;
+  }
 
-  socket.on("find_match", () => {
-    // Logic to remove from current chat if exists
-    if (activeChats.has(socket.id)) leaveRoom(socket);
-    if (waitingQueue.has(socket.id)) return;
+  // Join private room for direct signaling
+  socket.join(userId);
 
-    if (waitingQueue.size > 0) {
-      const [partnerId] = waitingQueue;
-      waitingQueue.delete(partnerId);
+  // Rejoin logic (Persistence)
+  if (userRooms.has(userId)) {
+    const roomId = userRooms.get(userId);
+    socket.join(roomId);
+    socket.emit("match_found", { roomId, isRejoin: true });
+  }
 
-      const partnerSocket = io.sockets.sockets.get(partnerId);
+  // --- 1. FIND MATCH LOGIC ---
+  socket.on("find_match", (userData) => {
+    // userData comes from client: { name, gender, age, filterGender, captchaToken }
+    
+    // Safety: If already in a room, ignore
+    if (userRooms.has(userId)) return;
 
-      if (!partnerSocket) {
-        socket.emit("find_match"); 
-        return;
+    // Safety: If already waiting, update info but don't duplicate
+    if (waitingQueue.has(userId)) {
+      waitingQueue.set(userId, { socketId: socket.id, ...userData });
+      return;
+    }
+
+    console.log(`🔍 User ${userData.name} (${userData.gender}) looking for ${userData.filterGender}`);
+
+    // --- MATCHING ALGORITHM ---
+    let matchId = null;
+
+    for (const [candidateId, candidateData] of waitingQueue.entries()) {
+      if (candidateId === userId) continue; // Don't match self
+
+      // 1. Do THEY match MY preference?
+      // (If I want 'all', anyone matches. If I want 'female', they must be 'female')
+      const myPrefMatches = 
+        userData.filterGender === 'all' || 
+        userData.filterGender === candidateData.gender;
+      
+      // 2. Do I match THEIR preference?
+      const theirPrefMatches = 
+        candidateData.filterGender === 'all' || 
+        candidateData.filterGender === userData.gender;
+
+      if (myPrefMatches && theirPrefMatches) {
+        matchId = candidateId;
+        break; // Found a match!
       }
+    }
 
-      const roomId = `room_${socket.id}_${partnerId}`;
+    if (matchId) {
+      // --- MATCH FOUND ---
+      // 1. Remove both from queue
+      waitingQueue.delete(matchId);
+      waitingQueue.delete(userId); 
+
+      // 2. Create Room
+      const roomId = `room_${userId}_${matchId}`;
+      userRooms.set(userId, roomId);
+      userRooms.set(matchId, roomId);
+
+      // 3. Join Room
       socket.join(roomId);
-      partnerSocket.join(roomId);
+      
+      // 4. Force Partner to Join (Signal them)
+      io.to(matchId).emit("force_join_room", { roomId });
 
-      activeChats.set(socket.id, roomId);
-      activeChats.set(partnerId, roomId);
-
+      // 5. Notify Both
       io.to(roomId).emit("match_found", { roomId });
+      console.log(`✅ Matched ${userId} with ${matchId}`);
+
     } else {
-      waitingQueue.add(socket.id);
+      // --- NO MATCH, ADD TO QUEUE ---
+      waitingQueue.set(userId, {
+        socketId: socket.id,
+        ...userData // Store profile data for others to check
+      });
     }
   });
 
+  // Handle forced join signal
+  socket.on("join_specific_room", ({ roomId }) => {
+    socket.join(roomId);
+  });
+
+  // --- 2. MESSAGING ---
   socket.on("send_message", (data) => {
-    const roomId = activeChats.get(socket.id);
+    const roomId = userRooms.get(userId);
     if (roomId) {
       socket.to(roomId).emit("receive_message", data);
     }
   });
 
+  // --- 3. SKIPPING ---
   socket.on("skip", () => {
-    const roomId = activeChats.get(socket.id);
+    const roomId = userRooms.get(userId);
+    
+    // Remove from queue if they were just searching
+    waitingQueue.delete(userId);
+
     if (roomId) {
+      // Notify partner
       socket.to(roomId).emit("partner_skipped");
-      leaveRoom(socket);
+      
+      // Clean up BOTH users from the room map
+      for (const [key, val] of userRooms.entries()) {
+        if (val === roomId) userRooms.delete(key);
+      }
+      
+      // Leave socket room
+      socket.leave(roomId);
     }
   });
 
+  // --- 4. DISCONNECT ---
   socket.on("disconnect", () => {
-    if (waitingQueue.has(socket.id)) waitingQueue.delete(socket.id);
-    const roomId = activeChats.get(socket.id);
-    if (roomId) {
-      socket.to(roomId).emit("partner_disconnected");
-      activeChats.delete(socket.id);
-    }
+    // Only remove from waiting queue. 
+    // We KEEP the room active for a bit in case they reconnect (app switch/internet blip)
+    waitingQueue.delete(userId);
   });
-
-  const leaveRoom = (userSocket) => {
-    const roomId = activeChats.get(userSocket.id);
-    if (roomId) {
-      userSocket.leave(roomId);
-      activeChats.delete(userSocket.id);
-    }
-  };
 });
 
-httpServer.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+httpServer.listen(PORT);
