@@ -1,155 +1,239 @@
 const { Server } = require("socket.io");
 const http = require("http");
 
+// --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
 
+// --- HTTP SERVER ---
 const httpServer = http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end("Mingalabar Chat Server is Online!");
+  // Health check endpoint for Render/Uptime monitors
+  if (req.url === '/') {
+    res.writeHead(200);
+    res.end("Mingalabar Chat Server is Online (v2.0)");
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
 });
 
+// --- SOCKET SERVER CONFIG ---
 const io = new Server(httpServer, {
-  cors: { origin: "*" },
-  pingInterval: 10000,
-  pingTimeout: 5000,
+  cors: {
+    origin: "*", // Allow connections from any mobile app source
+    methods: ["GET", "POST"]
+  },
+  pingInterval: 10000, // Send heartbeat every 10s
+  pingTimeout: 5000,   // Disconnect if no response after 5s
 });
 
-// --- STATE MANAGEMENT ---
+// --- IN-MEMORY STATE ---
+// Best for single-instance deployments (Render Free/Starter, DigitalOcean Droplet)
+
 // Maps userId -> roomId
+// Tracks which room a user is currently active in.
 const userRooms = new Map(); 
 
 // Maps userId -> { socketId, name, gender, age, filterGender }
+// Tracks users actively looking for a match.
 const waitingQueue = new Map(); 
 
 console.log(`🚀 Server starting on port ${PORT}`);
 
+// --- CONNECTION HANDLER ---
 io.on("connection", (socket) => {
+  // 1. AUTHENTICATION (Simplified)
+  // In a real app, verify a JWT token here.
   const userId = socket.handshake.query.userId;
   
   if (!userId) {
-    console.log("❌ Connection rejected: No userId");
+    console.warn(`[!] Connection rejected: No userId from ${socket.id}`);
     socket.disconnect();
     return;
   }
 
-  // Join private room for direct signaling
+  // console.log(`[+] User connected: ${userId} (${socket.id})`);
+
+  // Join a private channel based on userId.
+  // This allows us to signal this user even if they change socket IDs (reconnect).
   socket.join(userId);
 
-  // Rejoin logic (Persistence)
+  // 2. SESSION RECOVERY
+  // If the user was in a room, puts them back in.
   if (userRooms.has(userId)) {
     const roomId = userRooms.get(userId);
     socket.join(roomId);
     socket.emit("match_found", { roomId, isRejoin: true });
+    // console.log(`[~] User ${userId} rejoined room ${roomId}`);
   }
 
-  // --- 1. FIND MATCH LOGIC ---
+  // --- EVENTS ---
+
+  /**
+   * FIND MATCH
+   * The core matching logic. Matches based on mutual gender filtering.
+   */
   socket.on("find_match", (userData) => {
-    // userData comes from client: { name, gender, age, filterGender, captchaToken }
-    
-    // Safety: If already in a room, ignore
+    // userData: { name, gender, age, filterGender, captchaToken }
+
+    // If user is already in a room, they shouldn't be searching.
     if (userRooms.has(userId)) return;
 
-    // Safety: If already waiting, update info but don't duplicate
+    // Update queue entry with latest socket ID (handles quick reconnects)
+    // We strictly use .set() to ensure data is fresh.
     if (waitingQueue.has(userId)) {
       waitingQueue.set(userId, { socketId: socket.id, ...userData });
       return;
     }
 
-    console.log(`🔍 User ${userData.name} (${userData.gender}) looking for ${userData.filterGender}`);
+    // console.log(`[?] Search: ${userData.name} (${userData.gender}) -> ${userData.filterGender}`);
 
-    // --- MATCHING ALGORITHM ---
     let matchId = null;
 
+    // ITERATE QUEUE to find a mutual match
     for (const [candidateId, candidateData] of waitingQueue.entries()) {
-      if (candidateId === userId) continue; // Don't match self
+      // Don't match self
+      if (candidateId === userId) continue;
 
       // 1. Do THEY match MY preference?
-      // (If I want 'all', anyone matches. If I want 'female', they must be 'female')
-      const myPrefMatches = 
+      const matchMyPref = 
         userData.filterGender === 'all' || 
         userData.filterGender === candidateData.gender;
       
       // 2. Do I match THEIR preference?
-      const theirPrefMatches = 
+      const matchTheirPref = 
         candidateData.filterGender === 'all' || 
         candidateData.filterGender === userData.gender;
 
-      if (myPrefMatches && theirPrefMatches) {
+      if (matchMyPref && matchTheirPref) {
         matchId = candidateId;
-        break; // Found a match!
+        break; // Stop looking, found one.
       }
     }
 
     if (matchId) {
       // --- MATCH FOUND ---
-      // 1. Remove both from queue
+      
+      // 1. Get Candidate Data
+      const partnerData = waitingQueue.get(matchId);
+      
+      // 2. Critical Check: Is the partner's socket still valid?
+      const partnerSocket = io.sockets.sockets.get(partnerData.socketId);
+
+      if (!partnerSocket) {
+        // Partner disconnected silently (zombie). Remove them and retry.
+        waitingQueue.delete(matchId);
+        socket.emit("find_match", userData); // Recursive retry for self
+        return;
+      }
+
+      // 3. Remove both from Queue
       waitingQueue.delete(matchId);
       waitingQueue.delete(userId); 
 
-      // 2. Create Room
+      // 4. Create & Persist Room
       const roomId = `room_${userId}_${matchId}`;
       userRooms.set(userId, roomId);
       userRooms.set(matchId, roomId);
 
-      // 3. Join Room
+      // 5. ATOMIC JOIN (The Fix for Race Conditions)
+      // Force both sockets into the room immediately.
       socket.join(roomId);
-      
-      // 4. Force Partner to Join (Signal them)
-      io.to(matchId).emit("force_join_room", { roomId });
+      partnerSocket.join(roomId);
 
-      // 5. Notify Both
-      io.to(roomId).emit("match_found", { roomId });
-      console.log(`✅ Matched ${userId} with ${matchId}`);
+      // 6. Notify Room
+      io.to(roomId).emit("match_found", { 
+        roomId, 
+        partnerName: partnerData.name // Optional: Send name if not anonymous
+      });
+      
+      console.log(`[✅] Matched: ${userId} <--> ${matchId}`);
 
     } else {
       // --- NO MATCH, ADD TO QUEUE ---
       waitingQueue.set(userId, {
         socketId: socket.id,
-        ...userData // Store profile data for others to check
+        ...userData 
       });
     }
   });
 
-  // Handle forced join signal
-  socket.on("join_specific_room", ({ roomId }) => {
-    socket.join(roomId);
-  });
-
-  // --- 2. MESSAGING ---
+  /**
+   * SEND MESSAGE
+   * Relays message to the room.
+   */
   socket.on("send_message", (data) => {
     const roomId = userRooms.get(userId);
     if (roomId) {
+      // Broadcast to everyone in room EXCEPT sender (optimized bandwidth)
       socket.to(roomId).emit("receive_message", data);
+    } else {
+      // Edge Case: User sent message but room is dead
+      socket.emit("partner_skipped");
     }
   });
 
-  // --- 3. SKIPPING ---
+  /**
+   * SKIP / NEXT
+   * User wants to end the chat.
+   */
   socket.on("skip", () => {
     const roomId = userRooms.get(userId);
     
-    // Remove from queue if they were just searching
+    // Always remove from queue to be safe
     waitingQueue.delete(userId);
 
     if (roomId) {
-      // Notify partner
+      // 1. Notify Partner
       socket.to(roomId).emit("partner_skipped");
       
-      // Clean up BOTH users from the room map
+      // 2. Cleanup Memory (Remove both users from room map)
+      // We iterate to find the partner ID. 
+      // (Optimization: In Redis architecture, we would store partner ID directly)
       for (const [key, val] of userRooms.entries()) {
         if (val === roomId) userRooms.delete(key);
       }
       
-      // Leave socket room
+      // 3. Cleanup Socket
+      // We leave the room so we don't get ghost messages
       socket.leave(roomId);
+      
+      // console.log(`[XX] Room closed by ${userId}`);
     }
   });
 
-  // --- 4. DISCONNECT ---
+  /**
+   * DISCONNECT
+   * Handle app close or network loss.
+   */
   socket.on("disconnect", () => {
-    // Only remove from waiting queue. 
-    // We KEEP the room active for a bit in case they reconnect (app switch/internet blip)
-    waitingQueue.delete(userId);
+    // 1. Remove from Waiting Queue immediately
+    if (waitingQueue.has(userId)) {
+      waitingQueue.delete(userId);
+    }
+
+    // Note: We DO NOT remove from 'userRooms' immediately.
+    // This allows for a "grace period" if the user briefly loses internet
+    // or switches apps. The 'skip' logic handles permanent closure.
+    
+    // Optional: Notify partner "Partner paused..." via 'partner_disconnected' event
+    // if you want to show a grey status dot.
+    
+    // console.log(`[-] User disconnected: ${userId}`);
   });
 });
 
-httpServer.listen(PORT);
+// --- START SERVER ---
+httpServer.listen(PORT, () => {
+  console.log(`\n>>> Server active at http://localhost:${PORT} <<<\n`);
+});
+```
+
+### Deployment Instructions
+Since you are using Render + GitHub:
+1.  Save this content into your local `server.js`.
+2.  Open your terminal in that folder.
+3.  Run:
+    ```bash
+    git add server.js
+    git commit -m "Update server logic to professional standard"
+    git push
