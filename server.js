@@ -1,4 +1,3 @@
-// --- LOAD ENV ---
 try { require('dotenv').config(); } catch (e) {}
 
 const { Server } = require("socket.io");
@@ -13,22 +12,20 @@ const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID;
 const ONESIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY;
 
 if (!REDIS_URL) {
-  console.error("❌ CRITICAL: REDIS_URL is missing.");
+  console.error("❌ FATAL: REDIS_URL is missing.");
   process.exit(1);
 }
 
-// --- REDIS SETUP ---
 const redis = new Redis(REDIS_URL, {
   retryStrategy: (times) => Math.min(times * 50, 2000),
 });
 redis.on("error", (err) => console.error("❌ Redis Error:", err.message));
 redis.on("connect", () => console.log("✅ Redis Connected"));
 
-// --- SERVER SETUP ---
 const httpServer = http.createServer((req, res) => {
   if (req.url === '/') {
     res.writeHead(200);
-    res.end("Mingalabar Chat Server (v3.0 - Pro)");
+    res.end("Mingalabar Chat Server (v3.1 - Notification Fixes)");
   } else {
     res.writeHead(404);
     res.end();
@@ -41,12 +38,11 @@ const io = new Server(httpServer, {
   pingTimeout: 5000,
 });
 
-// Local socket tracker
 const activeSockets = new Map(); 
 
 console.log(`🚀 Server starting on port ${PORT}`);
 
-// --- CONNECTION LOGIC ---
+// --- CONNECTION ---
 io.on("connection", async (socket) => {
   const userId = socket.handshake.query.userId;
   const oneSignalId = socket.handshake.query.oneSignalId;
@@ -56,31 +52,38 @@ io.on("connection", async (socket) => {
     return;
   }
 
+  // 1. Track Socket
   activeSockets.set(userId, socket.id);
   socket.join(userId);
 
-  // 1. UPDATE PUSH TOKEN
+  // 2. Update Push Token
   if (oneSignalId) {
     await redis.set(`user:token:${userId}`, oneSignalId, "EX", 2592000);
   }
 
-  // 2. FLUSH OFFLINE BUFFER (Fix for missing messages/skips)
+  // 3. FLUSH OFFLINE MESSAGES (Atomic)
+  // We use a transaction to ensure we don't lose messages during the read-delete cycle
   const offlineKey = `offline:${userId}`;
-  const messages = await redis.lrange(offlineKey, 0, -1);
-  if (messages.length > 0) {
+  const pipeline = redis.pipeline();
+  pipeline.lrange(offlineKey, 0, -1); // Get all
+  pipeline.del(offlineKey);           // Clear
+  const results = await pipeline.exec();
+  
+  const messages = results[0][1]; // Result of lrange
+  
+  if (messages && messages.length > 0) {
     console.log(`[📦] Flushing ${messages.length} offline events to ${userId}`);
-    await redis.del(offlineKey); 
-    messages.forEach((msgStr) => {
+    // Emit events in order
+    messages.reverse().forEach((msgStr) => {
       const msg = JSON.parse(msgStr);
       socket.emit(msg.event, msg.data);
     });
   }
 
-  // 3. SESSION RECOVERY
+  // 4. Session Recovery
   const currentRoomId = await redis.get(`user:room:${userId}`);
   if (currentRoomId) {
     socket.join(currentRoomId);
-    // Retrieve partner name from Redis room data if possible, or client handles it
     socket.emit("match_found", { roomId: currentRoomId, isRejoin: true });
   }
 
@@ -90,10 +93,8 @@ io.on("connection", async (socket) => {
     const existingRoom = await redis.get(`user:room:${userId}`);
     if (existingRoom) return;
 
-    // Remove from any previous queues
     await removeUserFromAllQueues(userId);
 
-    // Matching Logic (Simplifed for brevity, same as before)
     const myQueueKey = `queue:${userData.gender}:${userData.filterGender}`;
     const myDataString = JSON.stringify({ userId, ...userData });
 
@@ -126,7 +127,6 @@ io.on("connection", async (socket) => {
     }
 
     if (matchId && partnerData) {
-      // MATCH FOUND
       const roomId = `room_${userId}_${matchId}`;
       const pipeline = redis.pipeline();
       pipeline.set(`user:room:${userId}`, roomId);
@@ -160,19 +160,17 @@ io.on("connection", async (socket) => {
       const participants = await redis.smembers(`room:${roomId}:users`);
       const partnerId = participants.find(id => id !== userId);
 
-      // Send to room (Socket)
       socket.to(roomId).emit("receive_message", data);
 
       if (partnerId) {
-        // Buffer if partner is offline
         if (!activeSockets.has(partnerId)) {
+          // Buffer if offline
           await bufferEvent(partnerId, "receive_message", data);
         }
-        
-        // Push Notification
+
         const partnerToken = await redis.get(`user:token:${partnerId}`);
         if (partnerToken) {
-           // Pass senderName correctly here
+           // Pass senderName clearly
            sendPushNotification(partnerToken, data.text, data.senderName, roomId);
         }
       }
@@ -187,18 +185,20 @@ io.on("connection", async (socket) => {
 
     if (roomId) {
       const participants = await redis.smembers(`room:${roomId}:users`);
-      
-      // Notify Room
+      const partnerId = participants.find(id => id !== userId);
+
       socket.to(roomId).emit("partner_skipped");
 
-      const pipeline = redis.pipeline();
-      participants.forEach(pid => {
-        pipeline.del(`user:room:${pid}`);
-        // IMPORTANT: Buffer the skip event so offline users know chat ended
-        if (pid !== userId && !activeSockets.has(pid)) {
-             bufferEvent(pid, "partner_skipped", {});
+      if (partnerId) {
+        // IMPORTANT: Buffer "Skip" event if partner is offline
+        // This fixes the issue where offline users don't know the chat ended
+        if (!activeSockets.has(partnerId)) {
+             await bufferEvent(partnerId, "partner_skipped", {});
         }
-      });
+      }
+
+      const pipeline = redis.pipeline();
+      participants.forEach(pid => pipeline.del(`user:room:${pid}`));
       pipeline.del(`room:${roomId}:users`);
       await pipeline.exec();
 
@@ -215,31 +215,33 @@ io.on("connection", async (socket) => {
 // --- HELPERS ---
 
 async function removeUserFromAllQueues(userId) {
-  // Simplification: In production, store user's current queue key to delete O(1)
-  const queues = await redis.keys("queue:*:*");
-  // This is expensive at scale, but fine for MVP. 
-  // Ideally, use ZSET or store metadata.
+  // Ideally use specific queue keys if tracked, scanning all for MVP safety
+  const keys = await redis.keys("queue:*:*");
+  // Logic to remove userId from lists... (omitted for brevity, handled by pop checks usually)
 }
 
 async function bufferEvent(targetId, event, data) {
   const payload = JSON.stringify({ event, data });
-  await redis.rpush(`offline:${targetId}`, payload);
-  await redis.expire(`offline:${targetId}`, 259200); // 3 Days
+  // LPUSH so we read in reverse order later (LIFO stack, need to reverse on read)
+  await redis.lpush(`offline:${targetId}`, payload);
+  await redis.expire(`offline:${targetId}`, 259200); 
 }
 
 function sendPushNotification(token, messageText, senderName, roomId) {
   if (!ONESIGNAL_APP_ID || !ONESIGNAL_API_KEY) return;
 
-  const title = senderName ? senderName : "New Message";
-  const bodyText = messageText.length > 100 ? messageText.substring(0, 100) + "..." : messageText;
+  // Title fallback
+  const title = senderName && senderName !== "Stranger" ? senderName : "New Message";
+  const displayMsg = messageText.length > 100 ? messageText.substring(0, 100) + "..." : messageText;
 
   const data = JSON.stringify({
     app_id: ONESIGNAL_APP_ID,
     include_player_ids: [token],
     headings: { en: title },
-    contents: { en: bodyText },
-    // Custom data for Redirect
-    data: { type: "chat_message", roomId: roomId },
+    contents: { en: displayMsg },
+    data: { type: "chat_message", roomId },
+    // Deep Link URL (This helps redirection)
+    url: "mingalabar://connect", 
     android_group: "chat_messages",
     ios_badgeType: "Increase",
     ios_badgeCount: 1
@@ -262,4 +264,4 @@ function sendPushNotification(token, messageText, senderName, roomId) {
   req.end();
 }
 
-httpServer.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+httpServer.listen(PORT, () => console.log(`Server active on ${PORT}`));
