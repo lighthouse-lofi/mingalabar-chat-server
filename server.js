@@ -25,7 +25,7 @@ redis.on("connect", () => console.log("✅ Redis Connected"));
 const httpServer = http.createServer((req, res) => {
   if (req.url === '/') {
     res.writeHead(200);
-    res.end("Mingalabar Chat Server (v3.1 - Notification Fixes)");
+    res.end("Mingalabar Chat Server (v3.2 - Sync Fix)");
   } else {
     res.writeHead(404);
     res.end();
@@ -61,26 +61,7 @@ io.on("connection", async (socket) => {
     await redis.set(`user:token:${userId}`, oneSignalId, "EX", 2592000);
   }
 
-  // 3. FLUSH OFFLINE MESSAGES (Atomic)
-  // We use a transaction to ensure we don't lose messages during the read-delete cycle
-  const offlineKey = `offline:${userId}`;
-  const pipeline = redis.pipeline();
-  pipeline.lrange(offlineKey, 0, -1); // Get all
-  pipeline.del(offlineKey);           // Clear
-  const results = await pipeline.exec();
-  
-  const messages = results[0][1]; // Result of lrange
-  
-  if (messages && messages.length > 0) {
-    console.log(`[📦] Flushing ${messages.length} offline events to ${userId}`);
-    // Emit events in order
-    messages.reverse().forEach((msgStr) => {
-      const msg = JSON.parse(msgStr);
-      socket.emit(msg.event, msg.data);
-    });
-  }
-
-  // 4. Session Recovery
+  // 3. RECOVER ROOM (If active)
   const currentRoomId = await redis.get(`user:room:${userId}`);
   if (currentRoomId) {
     socket.join(currentRoomId);
@@ -88,6 +69,27 @@ io.on("connection", async (socket) => {
   }
 
   // --- EVENTS ---
+
+  // [FIX] New Event: Explicitly sync messages only when client is ready
+  socket.on("sync_messages", async () => {
+    const offlineKey = `offline:${userId}`;
+    const pipeline = redis.pipeline();
+    pipeline.lrange(offlineKey, 0, -1); // Get all
+    pipeline.del(offlineKey);           // Clear
+    const results = await pipeline.exec();
+    
+    // results[0][1] contains the array of strings from Redis
+    const messages = results[0][1]; 
+    
+    if (messages && messages.length > 0) {
+      console.log(`[📦] Flushing ${messages.length} offline events to ${userId}`);
+      // Redis lpush/lrange gives LIFO order, so we reverse to get chronological order
+      messages.reverse().forEach((msgStr) => {
+        const msg = JSON.parse(msgStr);
+        socket.emit(msg.event, msg.data);
+      });
+    }
+  });
 
   socket.on("find_match", async (userData) => {
     const existingRoom = await redis.get(`user:room:${userId}`);
@@ -142,7 +144,8 @@ io.on("connection", async (socket) => {
         io.to(partnerSocketId).emit("match_found", { roomId, partnerName: userData.name });
       } else {
         await bufferEvent(matchId, "match_found", { roomId, partnerName: userData.name });
-        sendPushNotification(matchId, "You found a match!", "System", roomId);
+        // [FIX] Send notification for match with User Name
+        sendPushNotification(matchId, "You found a match!", userData.name, roomId);
       }
 
       socket.emit("match_found", { roomId, partnerName: partnerData.name });
@@ -153,13 +156,14 @@ io.on("connection", async (socket) => {
   });
 
   socket.on("send_message", async (data) => {
-    // data: { text, senderName }
+    // data expected: { text, senderName }
     const roomId = await redis.get(`user:room:${userId}`);
     
     if (roomId) {
       const participants = await redis.smembers(`room:${roomId}:users`);
       const partnerId = participants.find(id => id !== userId);
 
+      // Send to everyone in room EXCEPT sender
       socket.to(roomId).emit("receive_message", data);
 
       if (partnerId) {
@@ -170,7 +174,7 @@ io.on("connection", async (socket) => {
 
         const partnerToken = await redis.get(`user:token:${partnerId}`);
         if (partnerToken) {
-           // Pass senderName clearly
+           // [FIX] Pass senderName to notification function
            sendPushNotification(partnerToken, data.text, data.senderName, roomId);
         }
       }
@@ -190,8 +194,7 @@ io.on("connection", async (socket) => {
       socket.to(roomId).emit("partner_skipped");
 
       if (partnerId) {
-        // IMPORTANT: Buffer "Skip" event if partner is offline
-        // This fixes the issue where offline users don't know the chat ended
+        // Buffer "Skip" event if partner is offline
         if (!activeSockets.has(partnerId)) {
              await bufferEvent(partnerId, "partner_skipped", {});
         }
@@ -215,14 +218,14 @@ io.on("connection", async (socket) => {
 // --- HELPERS ---
 
 async function removeUserFromAllQueues(userId) {
-  // Ideally use specific queue keys if tracked, scanning all for MVP safety
+  // Ideally use specific queue keys if tracked
   const keys = await redis.keys("queue:*:*");
-  // Logic to remove userId from lists... (omitted for brevity, handled by pop checks usually)
+  // Logic to remove userId from lists... (omitted for brevity)
 }
 
 async function bufferEvent(targetId, event, data) {
   const payload = JSON.stringify({ event, data });
-  // LPUSH so we read in reverse order later (LIFO stack, need to reverse on read)
+  // LPUSH to start of list. When reading, we read all and reverse.
   await redis.lpush(`offline:${targetId}`, payload);
   await redis.expire(`offline:${targetId}`, 259200); 
 }
@@ -230,17 +233,22 @@ async function bufferEvent(targetId, event, data) {
 function sendPushNotification(token, messageText, senderName, roomId) {
   if (!ONESIGNAL_APP_ID || !ONESIGNAL_API_KEY) return;
 
-  // Title fallback
+  // [FIX] Use Sender Name as Title
   const title = senderName && senderName !== "Stranger" ? senderName : "New Message";
   const displayMsg = messageText.length > 100 ? messageText.substring(0, 100) + "..." : messageText;
 
   const data = JSON.stringify({
     app_id: ONESIGNAL_APP_ID,
     include_player_ids: [token],
-    headings: { en: title },
-    contents: { en: displayMsg },
-    data: { type: "chat_message", roomId },
-    // Deep Link URL (This helps redirection)
+    headings: { en: title },   // <--- This sets the Title
+    contents: { en: displayMsg }, // <--- This sets the Body
+    // [FIX] Custom data for client redirection
+    data: { 
+        type: "chat_message", 
+        roomId: roomId,
+        senderName: senderName 
+    },
+    // Deep Link URL (Optional, handled by event listener mostly)
     url: "mingalabar://connect", 
     android_group: "chat_messages",
     ios_badgeType: "Increase",
